@@ -1,7 +1,3 @@
-# скопируйте код ниже #
-
-# dags/clean_churn.py
-
 import pendulum
 from airflow.decorators import dag, task
 
@@ -17,12 +13,12 @@ def clean_churn_dataset():
     @task()
     def create_table():
         from sqlalchemy import Table, Column, DateTime, Float, Integer, Index, MetaData, String, UniqueConstraint, inspect
-        hook = PostgresHook(# Ваш код здесь #)
+        hook = PostgresHook("destination_db")
         db_engine = hook.get_sqlalchemy_engine()
 
         metadata = MetaData()
 
-        churn_table = Table(# Ваш код здесь #, metadata,
+        churn_table = Table('users_churn', metadata, 
             Column('id', Integer, primary_key=True, autoincrement=True),
             Column('customer_id', String),
             Column('begin_date', DateTime),
@@ -53,7 +49,17 @@ def clean_churn_dataset():
     def extract():
         hook = PostgresHook('destination_db')
         conn = hook.get_conn()
-        sql = # Ваш код здесь #
+        sql = f"""
+                select
+                    c.customer_id, c.begin_date, c.end_date, c.type, c.paperless_billing, c.payment_method, c.monthly_charges, c.total_charges,
+                    i.internet_service, i.online_security, i.online_backup, i.device_protection, i.tech_support, i.streaming_tv, i.streaming_movies,
+                    p.gender, p.senior_citizen, p.partner, p.dependents,
+                    ph.multiple_lines
+                from contracts as c
+                left join internet as i on i.customer_id = c.customer_id
+                left join personal as p on p.customer_id = c.customer_id
+                left join phone as ph on ph.customer_id = c.customer_id
+                """
         data = pd.read_sql(sql, conn).drop(columns=['id'])
         conn.close()
         return data
@@ -61,16 +67,50 @@ def clean_churn_dataset():
     @task()
     def transform(data: pd.DataFrame):
 
-        
-
+        # Очистка данных от дубликатов
         def remove_duplicates(data):
             feature_cols = data.columns.drop('customer_id').tolist()
             is_duplicated_features = data.duplicated(subset=feature_cols, keep=False)
             data = data[~is_duplicated_features].reset_index(drop=True)
             return data
 
+        # Заполнение пропусков
+        def fill_missing_values(data):
+            cols_with_nans = data.isnull().sum()
+            cols_with_nans = cols_with_nans[cols_with_nans > 0].index.drop('end_date')
+            for col in cols_with_nans:
+                if data[col].dtype in [float, int]:
+                    fill_value = data[col].mean()
+                elif data[col].dtype == 'object':
+                    fill_value = data[col].mode().iloc[0]
+                data[col] = data[col].fillna(fill_value)
+            return data
 
+        # Отсев выбросов по методу IQR (Interquantile Range)
+        def remove_outliers(data):
+            num_cols = data.select_dtypes(['float']).columns
+            threshold = 1.5
+            potential_outliers = pd.DataFrame()
 
+            for col in num_cols:
+                Q1 = data[col].quantile(0.25)
+                Q3 = data[col].quantile(0.75)
+                IQR = Q3 - Q1
+                margin = threshold*IQR
+                lower = Q1 - margin
+                upper = Q3 + margin
+                potential_outliers[col] = ~data[col].between(lower, upper)
+
+            outliers = potential_outliers.any(axis=1)
+            return data
+
+        data = remove_duplicates(data)
+        data = fill_missing_values(data)
+        data = remove_outliers(data)
+
+        data['target'] = (data['end_date'] != 'No').astype(int)
+        data['end_date'].replace({'No': None}, inplace=True)
+        
         return data
 
     @task()
@@ -78,7 +118,7 @@ def clean_churn_dataset():
         hook = PostgresHook('destination_db')
         data['end_date'] = data['end_date'].astype('object').replace(np.nan, None)
         hook.insert_rows(
-            table= # Ваш код здесь #,
+            table= "clean_users_churn",
             replace=True,
             target_fields=data.columns.tolist(),
             replace_index=['customer_id'],
